@@ -1,24 +1,33 @@
 import argparse
-import logging
-import pprint
-import mxnet as mx
-import numpy as np
-import os
 import importlib
-
-from six.moves import reduce
-from six.moves import cPickle as pkl
+import logging
+import os
+import pprint
+import pickle as pkl
+from functools import reduce
 
 from core.detection_module import DetModule
 from utils import callback
 from utils.memonger_v2 import search_plan_to_layer
-from utils.lr_scheduler import WarmupMultiFactorScheduler
+from utils.lr_scheduler import WarmupMultiFactorScheduler, LRSequential, AdvancedLRScheduler
 from utils.load_model import load_checkpoint
+from utils.patch_config import patch_config_as_nothrow
 
+import mxnet as mx
+import numpy as np
 
 def train_net(config):
     pGen, pKv, pRpn, pRoi, pBbox, pDataset, pModel, pOpt, pTest, \
     transform, data_name, label_name, metric_list = config.get_config(is_train=True)
+    pGen = patch_config_as_nothrow(pGen)
+    pKv = patch_config_as_nothrow(pKv)
+    pRpn = patch_config_as_nothrow(pRpn)
+    pRoi = patch_config_as_nothrow(pRoi)
+    pBbox = patch_config_as_nothrow(pBbox)
+    pDataset = patch_config_as_nothrow(pDataset)
+    pModel = patch_config_as_nothrow(pModel)
+    pOpt = patch_config_as_nothrow(pOpt)
+    pTest = patch_config_as_nothrow(pTest)
 
     ctx = [mx.gpu(int(i)) for i in pKv.gpus]
     pretrain_prefix = pModel.pretrain.prefix
@@ -35,9 +44,7 @@ def train_net(config):
     rank = kv.rank
 
     # for distributed training using shared file system
-    if rank == 0:
-        if not os.path.exists(save_path):
-            os.makedirs(save_path)
+    os.makedirs(save_path, exist_ok=True)
 
     from utils.logger import config_logger
     config_logger(os.path.join(save_path, "log.txt"))
@@ -78,7 +85,11 @@ def train_net(config):
         label_name=label_name,
         batch_size=input_batch_size,
         shuffle=True,
-        kv=kv
+        kv=kv,
+        num_worker=pGen.loader_worker or 12,
+        num_collector=pGen.loader_collector or 1,
+        worker_queue_depth=2,
+        collector_queue_depth=2
     )
 
     # infer shape
@@ -120,6 +131,13 @@ def train_net(config):
     else:
         arg_params, aux_params = load_checkpoint(pretrain_prefix, pretrain_epoch)
 
+    if pModel.process_weight is not None:
+        pModel.process_weight(sym, arg_params, aux_params)
+
+    # merge batch normalization to save memory in fix bn training
+    from utils.graph_optimize import merge_bn
+    sym, arg_params, aux_params = merge_bn(sym, arg_params, aux_params)
+
     if pModel.random:
         import time
         mx.random.seed(int(time.time()))
@@ -129,12 +147,13 @@ def train_net(config):
     init.set_verbosity(verbose=True)
 
     # create solver
-    fixed_param_prefix = pModel.pretrain.fixed_param
+    fixed_param = pModel.pretrain.fixed_param
+    excluded_param = pModel.pretrain.excluded_param
     data_names = [k[0] for k in train_data.provide_data]
     label_names = [k[0] for k in train_data.provide_label]
 
     mod = DetModule(sym, data_names=data_names, label_names=label_names,
-                    logger=logger, context=ctx, fixed_param_prefix=fixed_param_prefix)
+                    logger=logger, context=ctx, fixed_param=fixed_param, excluded_param=excluded_param)
 
     eval_metrics = mx.metric.CompositeEvalMetric(metric_list)
 
@@ -144,6 +163,7 @@ def train_net(config):
     sym.save(model_prefix + ".json")
 
     # decide learning rate
+    lr_mode = pOpt.optimizer.lr_mode or 'step'
     base_lr = pOpt.optimizer.lr * kv.num_workers
     lr_factor = 0.1
 
@@ -155,25 +175,50 @@ def train_net(config):
     if rank == 0:
         logging.info('total iter {}'.format(iter_per_epoch * (end_epoch - begin_epoch)))
         logging.info('lr {}, lr_iters {}'.format(current_lr, lr_iter_discount))
+        logging.info('lr mode: {}'.format(lr_mode))
+
     if pOpt.warmup is not None and pOpt.schedule.begin_epoch == 0:
         if rank == 0:
             logging.info(
                 'warmup lr {}, warmup step {}'.format(
                     pOpt.warmup.lr,
-                    pOpt.warmup.iter)
+                    pOpt.warmup.iter // kv.num_workers)
                 )
-
-        lr_scheduler = WarmupMultiFactorScheduler(
-            step=lr_iter_discount,
-            factor=lr_factor,
-            warmup=True,
-            warmup_type=pOpt.warmup.type,
-            warmup_lr=pOpt.warmup.lr,
-            warmup_step=pOpt.warmup.iter
-        )
+        if lr_mode == 'step':
+            lr_scheduler = WarmupMultiFactorScheduler(
+                step=lr_iter_discount,
+                factor=lr_factor,
+                warmup=True,
+                warmup_type=pOpt.warmup.type,
+                warmup_lr=pOpt.warmup.lr,
+                warmup_step=pOpt.warmup.iter // kv.num_workers
+            )
+        elif lr_mode == 'cosine':
+            warmup_lr_scheduler = AdvancedLRScheduler(
+                mode='linear', 
+                base_lr=pOpt.warmup.lr,
+                target_lr=base_lr, 
+                niters=pOpt.warmup.iter // kv.num_workers
+            )
+            cosine_lr_scheduler = AdvancedLRScheduler(
+                mode='cosine', 
+                base_lr=base_lr, 
+                target_lr=0,
+                niters=(iter_per_epoch * (end_epoch - begin_epoch) - pOpt.warmup.iter) // kv.num_workers
+            )
+            lr_scheduler = LRSequential([warmup_lr_scheduler, cosine_lr_scheduler])
+        else:
+            raise NotImplementedError
     else:
-        if len(lr_iter_discount) > 0:
+        if lr_mode == 'step':
             lr_scheduler = mx.lr_scheduler.MultiFactorScheduler(lr_iter_discount, lr_factor)
+        elif lr_mode == 'cosine':
+            lr_scheduler = AdvancedLRScheduler(
+                mode='cosine', 
+                base_lr=base_lr, 
+                target_lr=0,
+                niters=iter_per_epoch * (end_epoch - begin_epoch) // kv.num_workers
+            )
         else:
             lr_scheduler = None
 
@@ -191,6 +236,10 @@ def train_net(config):
         optimizer_params['multi_precision'] = True
         optimizer_params['rescale_grad'] /= 128.0
 
+    profile = pGen.profile or False
+    if profile:
+        mx.profiler.set_config(profile_all=True, filename=os.path.join(save_path, "profile.json"))
+
     # train
     mod.fit(
         train_data=train_data,
@@ -205,10 +254,13 @@ def train_net(config):
         arg_params=arg_params,
         aux_params=aux_params,
         begin_epoch=begin_epoch,
-        num_epoch=end_epoch
+        num_epoch=end_epoch,
+        profile=profile
     )
 
     logging.info("Training has done")
+    time.sleep(10)
+    logging.info("Exiting")
 
 
 def parse_args():
